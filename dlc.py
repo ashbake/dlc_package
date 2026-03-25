@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import os
 from pathlib import Path
 
-from scipy.ndimage import zoom, shift
+from scipy.ndimage import zoom, shift, rotate
 from pathlib import Path
 
 from astropy.convolution import Gaussian1DKernel, convolve
@@ -100,9 +100,13 @@ class DifferentialLimbCoupling(dlcSettings,
         self.diagnostics_on = diagnostics_on 
 
         # run through presets to load necessary files and settings for the class
-        self.loadCouplingMap()
+        self._loadCouplingMap()
 
-    def loadCouplingMap(self):
+        # create star
+        self._create_star_image()
+
+
+    def _loadCouplingMap(self):
         """ load coupling map for the telescope and zoom in on it
 
             loads plate scale for the coupling map
@@ -235,6 +239,12 @@ class DifferentialLimbCoupling(dlcSettings,
     def _create_star_image(self, ):
         """
          create a limb darkened star image with velocity map based on vsini and diameter of star
+
+         returns:
+            im_intensity - 2D array of limb darkened star intensity
+            vel_arr - 1D array of velocity values corresponding to the velocity map
+            stellar_im_vel - 2D array of the velocity map of the star, scaled by the limb darkened intensity and mask
+            vel_scale_pix - velocity scale in km/s per pixel for the velocity map
          """
         # compute the stellar diameter in the pixel units for the coupling image 
         radius_star_pix = (self.diameter / 2.) * 1./ self.plate_scale_coupling # pixels
@@ -269,38 +279,50 @@ class DifferentialLimbCoupling(dlcSettings,
         stellar_im_vel = plane_image * im_mask_int * im_intensity
         stellar_im_vel /= np.nanmax(stellar_im_vel)
         
-        return im_intensity, vel_arr, stellar_im_vel, vel_scale_pix
+        # store important variables
+        self.im_intensity, self.vel_arr, self.stellar_im_vel, self.vel_scale_pix = im_intensity, vel_arr, stellar_im_vel, vel_scale_pix
     
     @u.quantity_input
     def _create_lsfs(self, 
                            shifted_offset: u.mas, 
                            angle: u.deg):
         """
-        TODO - finish this docstring and converting function to class
+        Shift the coupling map and apply the stellar image to compute the
+          reference and shifted line spread profiles with their CCFs
+
+        inputs
+        ------
+        shifted_offset - offset collapsed to 1D (u.mas)
+        angle          - angle of shift to apply to coupling map (u.deg)
+        
+        returns
+        -------
+        coupling_map_shifted - the shifted coupling map based on the input offset and angle
+        vprof - the integrated line profile for the reference position
+        vprof_shifted - the integrated line profile for the shifted position
+        ccf_ref - the line profile convolved with a fake spectrometer PSF for the reference position
+        ccf_shifted - the line profile convolved with a fake spectrometer PSF for the shifted position
         """
         # Shift Coupling Map
         coupling_map_shifted   = self._apply_shift(self.coupling_map, shifted_offset, angle)
 
-        # Create stellar image intensity and respective velocity map
-        im_intensity, vel_arr, stellar_im_vel, vel_scale_pix = self._create_star_image()
-
         # Create Integrated Line Profiles
-        scale_fac_ref      = np.nanmax(np.nansum(im_intensity * self.coupling_map, axis=0))
-        scale_fac_shift    = np.nanmax(np.nansum(im_intensity * coupling_map_shifted, axis=0))
+        scale_fac_ref      = np.nanmax(np.nansum(self.im_intensity * self.coupling_map, axis=0))
+        scale_fac_shift    = np.nanmax(np.nansum(self.im_intensity * coupling_map_shifted, axis=0))
 
         # Integrate the line profile along for reference
-        vprof = np.nansum(im_intensity * self.coupling_map, axis=0)
+        vprof = np.nansum(self.im_intensity * self.coupling_map, axis=0)
         vprof /= scale_fac_ref
         vprof = (1. - vprof)
 
         # *** do the scalings serve to keep the total flux consistent (shifted flux will be less bc off fiber?)
-        vprof_shifted = np.nansum(im_intensity * coupling_map_shifted, axis=0)
+        vprof_shifted = np.nansum(self.im_intensity * coupling_map_shifted, axis=0)
         vprof_shifted /= scale_fac_shift
         vprof_shifted = (1. - vprof_shifted)
 
         # section for generating the spectrograph PSF convolution kernel
         spec_res_vel =  c.c / self.R # spectrometer resolution 
-        spec_kernel_wid = spec_res_vel / vel_scale_pix # PSF FWHM in image pixels
+        spec_kernel_wid = spec_res_vel / self.vel_scale_pix # PSF FWHM in image pixels
         spec_kernel_sigma = spec_kernel_wid / 2.335 # sigma of gaussian in pixels
         spec_kernel = Gaussian1DKernel(spec_kernel_sigma.decompose().value).array # final kernel
         print('res vel', spec_res_vel, 'spec kernel wid', spec_kernel_wid)
@@ -309,11 +331,14 @@ class DifferentialLimbCoupling(dlcSettings,
         ccf_ref  = convolve(vprof,spec_kernel,normalize_kernel=True, boundary='extend',fill_value=0)
         ccf_shifted  = convolve(vprof_shifted,spec_kernel,normalize_kernel=True, boundary='extend',fill_value=0)
 
-        return coupling_map_shifted, im_intensity, stellar_im_vel, vel_arr, vprof, vprof_shifted, ccf_ref, ccf_shifted
+        # these returns are computer per offset position, so don't store individual ones in class
+        return coupling_map_shifted, vprof, vprof_shifted, ccf_ref, ccf_shifted
 
-    def plot_star_fiber(self):
+    def plot_star_fiber_raw(self):
         """
-        plot the fiber coupling map and overplot the stellar positions with the reference star shown with its velocity map
+        plot the fiber coupling map and overplot the stellar positions with 
+        the reference star shown with its velocity map. This is the raw shifted
+        coupling maps with the star always in the center.
         """
         fig, axs = plt.subplots(1,3,figsize=[10,4])
         extent = self.plate_scale_coupling * len(self.stellar_im_vel)
@@ -339,46 +364,118 @@ class DifferentialLimbCoupling(dlcSettings,
 
         plt.show()
 
-    def plot_star_fiber_rotated(self):
+    def plot_star_fiber_RValigned(self):
         """
-        plot the fiber coupling map and overplot the stellar positions with the reference star shown with its velocity map
-        shift the coupling map back to be centered and rotate it so the star is at its correct angle
+        plot the fiber coupling map and overplot the stellar positions with the 
+        reference star shown with its velocity map. This shifts the coupling map 
+        back to be centered and rotate it so the star is at its correct angle
         """
         fig, axs = plt.subplots(1,3,figsize=[10,4])
-        extent = self.plate_scale_coupling * len(self.stellar_im_vel)
+        extent = self.plate_scale_coupling * self.coupling_map.shape[0]
         extent = extent.value
-        
-        # attempt to undo shift to coupling map star combo
-        first_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[0]  + self.coupling_maps_shifted[0]
-        shifted_offset, angle = self._compute_shift(self.xoffsets[0], self.yoffsets[0], self.theta)
-        unshifted_first_map = self._apply_shift(first_shifted_map, -1*shifted_offset, angle)
 
-        # attempt to undo shift to coupling map star combo
-        last_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[len(self.xoffsets)-1]  + self.coupling_maps_shifted[len(self.xoffsets)-1]
-        shifted_offset, angle = self._compute_shift(self.xoffsets[-1], self.yoffsets[-1], self.theta)
-        unshifted_last_map = self._apply_shift(last_shifted_map, -1*shifted_offset, angle)
-
+        # PLOT PANEL 0 - reference position
         axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
-        axs[1].imshow(unshifted_first_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
-        axs[2].imshow(unshifted_last_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        # rotate xoffset and yoffsets by theta to plot over the reference position
+        # the velocity axis is aligned and so the offsets need to be rotated to match the angle of the star
+        x_new = self.xoffsets * np.cos(-self.theta) - self.yoffsets * np.sin(-self.theta)
+        y_new = self.xoffsets * np.sin(-self.theta) + self.yoffsets * np.cos(-self.theta)
+        axs[0].plot(x_new, y_new, marker='x', color='k', label='Offset positions')
 
         axs[0].set_xlabel('X [mas]')
         axs[0].set_ylabel('Y [mas]')
         axs[0].set_title('Reference')
 
+        def deshift_coupling_map(coupling_map_shifted, xoffset, yoffset, theta):
+            """ function to shift the coupling map back to be centered """
+            shifted_offset, angle = self._compute_shift(xoffset,yoffset,theta)
+            unshifted_map = self._apply_shift(coupling_map_shifted, -1*shifted_offset, angle)
+            return unshifted_map
+        
+        # plot de shifted coupling map
+        unshifted_temp_map = np.zeros_like(self.coupling_map)
+        for i in range(len(self.xoffsets)):
+            temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] # + self.coupling_maps_shifted[i]
+            unshifted_temp_map += deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
+        
+        # PLOT PANEL 2 - shifted, derotated positions
+        axs[1].imshow(unshifted_temp_map + self.coupling_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[1].set_xlabel('X [mas]')
-        axs[1].set_title('First shifted')
+        axs[1].set_title(f'Offset Stellar Positions')
+        axs[1].plot(x_new, y_new, marker='x', color='k', alpha=0.1,label='Offset positions')
+        # TODO make coupling map contours
 
+        # third panel - plot just one
+        temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] + self.coupling_maps_shifted[i]
+        unshifted_temp_map = deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
+
+        axs[2].imshow(unshifted_temp_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[2].set_xlabel('X [mas]')
-        axs[2].set_title('Last shifted')
+        axs[2].set_title('Last Stellar Position')
+        axs[2].plot(x_new, y_new, marker='x', alpha=0.1, color='k', label='Offset positions')
 
-        # plot over reference the position of the xoffsets and yoffsets
-        axs[0].plot(self.xoffsets, self.yoffsets, marker='x', color='k', label='Offset positions')
-        #axs[0].legend()
-
+        # make super title
+        plt.suptitle(f'Star Coupling Maps, RV aligned\ntheta={self.theta}')
         plt.show()
 
+    def plot_star_fiber(self):
+        """
+        plot the fiber coupling map and overplot the stellar positions with the 
+        reference star shown with its velocity map. This shifts the coupling map 
+        back to be centered and rotate it so the star is at its correct angle
+        """
+        fig, axs = plt.subplots(1,3,figsize=[10,4])
+        extent = self.plate_scale_coupling * self.coupling_map.shape[0]
+        extent = extent.value
 
+        # PLOT PANEL 0 - reference position
+        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[0].plot(self.xoffsets, self.yoffsets, marker='x', color='k', label='Offset positions')
+
+        axs[0].set_xlabel('X [mas]')
+        axs[0].set_ylabel('Y [mas]')
+        axs[0].set_title('Reference')
+
+        def deshift_coupling_map(coupling_map_shifted, xoffset, yoffset, theta):
+            """ function to shift the coupling map back to be centered """
+            shifted_offset, angle = self._compute_shift(xoffset,yoffset,theta)
+            unshifted_map = self._apply_shift(coupling_map_shifted, -1*shifted_offset, angle)
+            return unshifted_map
+        
+        # plot de shifted coupling map
+        unshifted_temp_map = np.zeros_like(self.coupling_map)
+        for i in range(len(self.xoffsets)):
+            temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] # + self.coupling_maps_shifted[i]
+            unshifted_temp_map += deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
+        
+        # add rotate here
+        unshifted_derotated_temp_map = rotate(unshifted_temp_map, self.theta)
+        # rotating will create bigger array, so need to crop back down to original size
+        midpix = int(unshifted_derotated_temp_map.shape[0] / 2.)
+        wz = int(self.coupling_map.shape[0] / 2.)
+        unshifted_derotated_map = unshifted_derotated_temp_map[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
+        
+        # PLOT PANEL 2 - shifted, derotated positions
+        axs[1].imshow(unshifted_derotated_map + self.coupling_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[1].set_xlabel('X [mas]')
+        axs[1].set_title('Offset Stellar Positions')
+        axs[1].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1,label='Offset positions')
+        # TODO make coupling map contours
+
+        # third panel - plot just one
+        temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] + self.coupling_maps_shifted[i]
+        unshifted_temp_map = deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
+        test = rotate(unshifted_temp_map, self.theta)
+        midpix = int(test.shape[0] / 2.)
+        wz = int(self.coupling_map.shape[0] / 2.)
+        unshifted_derotated_map = test[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
+
+        axs[2].imshow(unshifted_derotated_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[2].set_xlabel('X [mas]')
+        axs[2].set_title('Last Stellar Position')
+        axs[2].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1, label='Offset positions')
+
+        plt.show()
 
     def plot_rvs(self, ):
         """
@@ -407,14 +504,13 @@ class DifferentialLimbCoupling(dlcSettings,
             print(yoffset)
             print(angle)
             print(shifted_offset)
-            coupling_map_shifted, im_intensity, stellar_im_vel,\
-                vel_arr, vprof, vprof_shifted, ccf_ref, ccf_shifted\
+            coupling_map_shifted, vprof, vprof_shifted, ccf_ref, ccf_shifted\
                     = self._create_lsfs(shifted_offset, angle)
             ccfs_shifted[i] = ccf_shifted
             coupling_maps_shifted[i] = coupling_map_shifted
             print('ccf min', np.argmin(ccf_shifted))
-            vel_ref   = vel_arr[np.argmin(ccf_ref)]
-            vel_shift = vel_arr[np.argmin(ccf_shifted)]
+            vel_ref   = self.vel_arr[np.argmin(ccf_ref)]
+            vel_shift = self.vel_arr[np.argmin(ccf_shifted)]
             print('vel', vel_shift - vel_ref)
             vels[i]   = vel_shift - vel_ref
             # save images of positions
@@ -427,8 +523,6 @@ class DifferentialLimbCoupling(dlcSettings,
         self.vels = vels * u.pix # don't't need the pixels unit
 
         # store other things for just the last iter for now for plotting
-        self.stellar_im_vel = stellar_im_vel
-        self.im_intensity = im_intensity
         self.coupling_maps_shifted = coupling_maps_shifted
         self.ccfs_shifted = ccfs_shifted
 
