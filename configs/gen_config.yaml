@@ -1,0 +1,20 @@
+# DLC Settings Configuration
+
+# INSTRUMENT
+telescope: Keck        # options: Keck, Hale, TMT
+R: 100000              # resolving power of instrument
+
+# OBSERVATION
+xoffsets: [0, 0]       # mas - offset PSF to fiber position in x
+yoffsets: [0, 0]       # mas - offset PSF to fiber position in y
+
+# JITTER
+tt_dyn: 0              # mas - dynamic tip/tilt jitter
+
+# STAR
+vsini: 2               # km/s - projected stellar rotation
+theta: 0               # deg - angle of stellar axis w.r.t. xy plane
+diameter: 13           # mas - stellar diameter
+
+# DAR
+DAR: true              # true/false - turn DAR on or off

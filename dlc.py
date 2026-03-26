@@ -19,6 +19,12 @@ from dataclasses import dataclass, field
 
 FILEPATH = Path(__file__).resolve().parent
 
+plt.style.use('dark_background')
+plt.rcParams['figure.figsize'] = [10,4]
+plt.rcParams['mathtext.fontset'] = 'custom'
+plt.rcParams['mathtext.cal'] = 'Helvetica Neue LT Pro'  # changes only the mathcal subfamily
+
+
 # use starry to make 2d model?
 class StellarModel():
     def __init__(self):
@@ -105,6 +111,8 @@ class DifferentialLimbCoupling(dlcSettings,
         # create star
         self._create_star_image()
 
+        # create instrument kernel
+        self._create_instrument_kernel()
 
     def _loadCouplingMap(self):
         """ load coupling map for the telescope and zoom in on it
@@ -220,7 +228,7 @@ class DifferentialLimbCoupling(dlcSettings,
 
         return shifted_offset, angle.to(u.deg)
     
-    def _apply_shift(self, coupling_map, shifted_offset, angle):
+    def _transform_coupling_map(self, coupling_map, shifted_offset, angle):
         """ apply the shift to the coupling map based on the shifted offset and angle
         """
         # compute the desired shift in image pixel units
@@ -282,57 +290,86 @@ class DifferentialLimbCoupling(dlcSettings,
         # store important variables
         self.im_intensity, self.vel_arr, self.stellar_im_vel, self.vel_scale_pix = im_intensity, vel_arr, stellar_im_vel, vel_scale_pix
     
+    def _create_instrument_kernel(self,):
+        """
+        section for generating the spectrograph PSF convolution kernel
+        saved in self.spec_kernel
+        """
+        spec_res_vel =  c.c / self.R # spectrometer resolution 
+        spec_kernel_wid = spec_res_vel / self.vel_scale_pix # PSF FWHM in image pixels
+        spec_kernel_sigma = spec_kernel_wid / 2.335 # sigma of gaussian in pixels
+        self.spec_kernel = Gaussian1DKernel(spec_kernel_sigma.decompose().value).array # final kernel
+        print('res vel', spec_res_vel, 'spec kernel wid', spec_kernel_wid)
+
     @u.quantity_input
-    def _create_lsfs(self, 
-                           shifted_offset: u.mas, 
-                           angle: u.deg):
+    def _create_lsf(self, coupling_map):
         """
         Shift the coupling map and apply the stellar image to compute the
           reference and shifted line spread profiles with their CCFs
 
         inputs
         ------
-        shifted_offset - offset collapsed to 1D (u.mas)
-        angle          - angle of shift to apply to coupling map (u.deg)
-        
+        coupling_map - the coupling map, already shifted if relevant
+       
         returns
         -------
-        coupling_map_shifted - the shifted coupling map based on the input offset and angle
         vprof - the integrated line profile for the reference position
         vprof_shifted - the integrated line profile for the shifted position
         ccf_ref - the line profile convolved with a fake spectrometer PSF for the reference position
         ccf_shifted - the line profile convolved with a fake spectrometer PSF for the shifted position
         """
-        # Shift Coupling Map
-        coupling_map_shifted   = self._apply_shift(self.coupling_map, shifted_offset, angle)
-
         # Create Integrated Line Profiles
-        scale_fac_ref      = np.nanmax(np.nansum(self.im_intensity * self.coupling_map, axis=0))
-        scale_fac_shift    = np.nanmax(np.nansum(self.im_intensity * coupling_map_shifted, axis=0))
-
-        # Integrate the line profile along for reference
-        vprof = np.nansum(self.im_intensity * self.coupling_map, axis=0)
-        vprof /= scale_fac_ref
+        scale_fac    = np.nanmax(np.nansum(self.im_intensity * coupling_map, axis=0))
+        vprof = np.nansum(self.im_intensity * coupling_map, axis=0)
+        vprof /= scale_fac
         vprof = (1. - vprof)
 
-        # *** do the scalings serve to keep the total flux consistent (shifted flux will be less bc off fiber?)
-        vprof_shifted = np.nansum(self.im_intensity * coupling_map_shifted, axis=0)
-        vprof_shifted /= scale_fac_shift
-        vprof_shifted = (1. - vprof_shifted)
-
-        # section for generating the spectrograph PSF convolution kernel
-        spec_res_vel =  c.c / self.R # spectrometer resolution 
-        spec_kernel_wid = spec_res_vel / self.vel_scale_pix # PSF FWHM in image pixels
-        spec_kernel_sigma = spec_kernel_wid / 2.335 # sigma of gaussian in pixels
-        spec_kernel = Gaussian1DKernel(spec_kernel_sigma.decompose().value).array # final kernel
-        print('res vel', spec_res_vel, 'spec kernel wid', spec_kernel_wid)
-
         # convolve the integrated line profil with the fake spectrometer PSF kernel
-        ccf_ref  = convolve(vprof,spec_kernel,normalize_kernel=True, boundary='extend',fill_value=0)
-        ccf_shifted  = convolve(vprof_shifted,spec_kernel,normalize_kernel=True, boundary='extend',fill_value=0)
+        ccf_shifted  = convolve(vprof,self.spec_kernel,normalize_kernel=True, boundary='extend',fill_value=0)
 
         # these returns are computer per offset position, so don't store individual ones in class
-        return coupling_map_shifted, vprof, vprof_shifted, ccf_ref, ccf_shifted
+        return vprof, ccf_shifted
+
+    def run(self):
+        """ 
+        run the DLC simulation with the current settings in the class
+        """
+        # get the reference line profile and ccf
+        self.vprof_ref, self.ccf_ref = self._create_lsf(self.coupling_map)
+
+        self.ccfs_shifted = {}
+        self.vprofs_shifted = {}
+        self.coupling_maps_shifted = {}
+        vels = np.zeros(len(self.yoffsets)) * u.km / u.s / u.pix
+        for i,yoffset in enumerate(self.yoffsets):
+            print('Running x,y position', self.xoffsets[i], yoffset)
+            
+            # compute shifted coupling map
+            shifted_offset, angle = self._compute_shift(self.xoffsets[i],yoffset,self.theta)
+            shifted_coupling_map = self._transform_coupling_map(self.coupling_map, shifted_offset, angle)
+            
+            # compute vprof and ccf for shifted position
+            vprof_shifted, ccf_shifted = self._create_lsf(shifted_coupling_map)
+            
+            # compute min velocity based on ccf
+            self.vel_ref   = self.vel_arr[np.argmin(self.ccf_ref)]
+            vel_shift = self.vel_arr[np.argmin(ccf_shifted)]
+            print('vel', vel_shift - self.vel_ref)
+            
+            # store outputs for this position
+            self.ccfs_shifted[i] = ccf_shifted
+            self.vprofs_shifted[i] = vprof_shifted
+            self.coupling_maps_shifted[i] = shifted_coupling_map
+            vels[i]   = vel_shift - self.vel_ref
+
+        self.vels = vels * u.pix # don't't need the pixels unit
+
+        if self.diagnostics_on:
+            self.plot_rvs()
+            self.plot_star_fiber()
+            #self.plot_star_fiber_RValigned()
+            #self.plot_star_fiber_raw()
+            self.plot_lsf_ccf()
 
     def plot_star_fiber_raw(self):
         """
@@ -361,6 +398,8 @@ class DifferentialLimbCoupling(dlcSettings,
         # plot over reference the position of the xoffsets and yoffsets
         axs[0].plot(self.xoffsets, self.yoffsets, marker='x', color='k', label='Offset positions')
         #axs[0].legend()
+        
+        plt.suptitle(f'Star Coupling Maps, As Calculated\ntheta={self.theta}')
 
         plt.show()
 
@@ -389,7 +428,7 @@ class DifferentialLimbCoupling(dlcSettings,
         def deshift_coupling_map(coupling_map_shifted, xoffset, yoffset, theta):
             """ function to shift the coupling map back to be centered """
             shifted_offset, angle = self._compute_shift(xoffset,yoffset,theta)
-            unshifted_map = self._apply_shift(coupling_map_shifted, -1*shifted_offset, angle)
+            unshifted_map = self._transform_coupling_map(coupling_map_shifted, -1*shifted_offset, angle)
             return unshifted_map
         
         # plot de shifted coupling map
@@ -439,7 +478,7 @@ class DifferentialLimbCoupling(dlcSettings,
         def deshift_coupling_map(coupling_map_shifted, xoffset, yoffset, theta):
             """ function to shift the coupling map back to be centered """
             shifted_offset, angle = self._compute_shift(xoffset,yoffset,theta)
-            unshifted_map = self._apply_shift(coupling_map_shifted, -1*shifted_offset, angle)
+            unshifted_map = self._transform_coupling_map(coupling_map_shifted, -1*shifted_offset, angle)
             return unshifted_map
         
         # plot de shifted coupling map
@@ -475,6 +514,8 @@ class DifferentialLimbCoupling(dlcSettings,
         axs[2].set_title('Last Stellar Position')
         axs[2].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1, label='Offset positions')
 
+        plt.suptitle(f'Star Coupling Maps, Natural View\ntheta={self.theta}')
+
         plt.show()
 
     def plot_rvs(self, ):
@@ -489,42 +530,47 @@ class DifferentialLimbCoupling(dlcSettings,
         ax.grid()
         plt.show()
 
-
-    def run(self):
-        """ 
-        run the DLC simulation with the current settings in the class
+    def plot_lsf_ccf(self,index=0):
         """
-        xoffset = self.xoffsets[0]
-        
-        ccfs_shifted = {}
-        coupling_maps_shifted = {}
-        vels = np.zeros(len(self.yoffsets)) * u.km / u.s / u.pix
-        for i,yoffset in enumerate(self.yoffsets):
-            shifted_offset, angle = self._compute_shift(xoffset,yoffset,self.theta)
-            print(yoffset)
-            print(angle)
-            print(shifted_offset)
-            coupling_map_shifted, vprof, vprof_shifted, ccf_ref, ccf_shifted\
-                    = self._create_lsfs(shifted_offset, angle)
-            ccfs_shifted[i] = ccf_shifted
-            coupling_maps_shifted[i] = coupling_map_shifted
-            print('ccf min', np.argmin(ccf_shifted))
-            vel_ref   = self.vel_arr[np.argmin(ccf_ref)]
-            vel_shift = self.vel_arr[np.argmin(ccf_shifted)]
-            print('vel', vel_shift - vel_ref)
-            vels[i]   = vel_shift - vel_ref
-            # save images of positions
-            #plt.figure()
-            #plt.imshow(coupling_map_shifted * im_intensity + coupling_map_shifted)
-            #middle_of_map = np.where(coupling_map_shifted == np.max(coupling_map_shifted))
-            #plt.plot(middle_of_map[1],middle_of_map[0],'kx')
-            #plt.savefig('./yposition_%smas_xposition_%smas_angle_%sdeg.png'%(yoffset, xoffset,self.theta))
-        
-        self.vels = vels * u.pix # don't't need the pixels unit
+        plot the line spread function and ccf for the reference and one of the shifted positions to visualize how the RV shift is happening
 
-        # store other things for just the last iter for now for plotting
-        self.coupling_maps_shifted = coupling_maps_shifted
-        self.ccfs_shifted = ccfs_shifted
+        inputs
+        ------
+        index - which shifted position to plot (default: 0)
+        """
+        # PLot the stellar profile and that convolved with the instrument profile
+        import matplotlib.patheffects as pe
+
+        ref_color = 'tab:gray'
+        shifted_color = 'tab:purple'
+
+        fig, axs = plt.subplots(2,1,figsize=[8, 5], sharex=True)
+
+        # Plot the stellar velocity profile (vprof)
+        axs[0].plot(self.vel_arr/self.vsini, self.vprof_ref, '-.', color=ref_color, label='On-axis',lw=5)
+        axs[0].plot(self.vel_arr/self.vsini, self.vprofs_shifted[index], '-', label='Off-axis',lw=5,color=shifted_color)
+
+        # plot the stellar velocity profile convolved with the instrument profile (CCF)
+        axs[1].plot(self.vel_arr/self.vsini, self.ccf_ref, '-.', label='On-axis CCF',lw=5,color=ref_color)
+        axs[1].plot(self.vel_arr/self.vsini, self.ccfs_shifted[index], '-', label='Off-axis CCF',lw=5,color=shifted_color)
+        
+        # plot the bestfit velocity as a vertical line
+        vel_ref   = self.vel_arr[np.argmin(self.ccf_ref)]
+        axs[1].axvline((self.vels[index] + vel_ref * u.pix)/self.vsini, color=shifted_color, alpha=0.3)
+        axs[1].axvline(self.vel_ref * u.pix/self.vsini, color=ref_color, alpha=0.3)
+
+
+        axs[0].set_xlim(-2., 2.)
+        axs[0].legend(loc='best',handlelength=2,handletextpad=0.5)#,ncols=2)
+        axs[0].set_ylabel('Relative Intensity')
+        axs[0].set_title('Stellar Velocity Profile')
+
+        axs[1].set_xlabel('Velocity [fraction of vsini]')
+        axs[1].set_title('CCF profile')
+        axs[1].set_ylabel('Relative Intensity')
+        axs[1].legend(loc='best',handlelength=2,handletextpad=0.5)#,ncols=2)
+
+        plt.show()
 
     def printSettings(self):
         """
