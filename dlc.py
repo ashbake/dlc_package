@@ -56,6 +56,20 @@ class StellarModel():
         """load phoenix model of star"""
         pass
 
+
+class AOJitter():
+    def __init__(self,):
+        pass
+
+    def generate_jitter(self, tt_dyn):
+        """generate a jitter pattern based on the time scale of the jitter and the exposure time"""
+        pass
+
+    def DAR(self):
+        """compute the DAR shift based on the zenith angle and wavelength range of the observation"""
+        pass
+
+
 @dataclass
 class dlcSettings():
     """All settings for DLC class"""
@@ -84,7 +98,8 @@ class dlcSettings():
     DAR: bool = True
 
 class DifferentialLimbCoupling(dlcSettings,
-                               StellarModel):
+                               StellarModel,
+                               AOJitter):
     """        
     inputs:
     ------
@@ -99,9 +114,10 @@ class DifferentialLimbCoupling(dlcSettings,
                  diagnostics_on=False):
         
         dlcSettings.__init__(self)  # make sure all attributes are applied from settings
-
+        
+        # override deafult settings with config file if provided
         if config != None: 
-            self._loadConfig(config) # override deafult settings with config file if provided
+            self._loadConfig(config) 
         
         self.diagnostics_on = diagnostics_on 
 
@@ -200,44 +216,56 @@ class DifferentialLimbCoupling(dlcSettings,
     
     @u.quantity_input
     def _compute_shift(self, 
-                       x: u.mas,
-                       y: u.mas,
+                       xoffset: u.mas,
+                       yoffset: u.mas,
                        theta: u.deg):
         """ translate the shift in x,y to angular deg to apply to coupling map
         in a way that utilizes the fiber symmetry
  
         inputs
         ------
-        x,y - offset position of star w.r.t. fiber (u.mas)
+        xoffset,yoffset - offset position of star w.r.t. fiber (u.mas)
         theta - angle of stellar axis w.r.t. xy plane (u.deg)
 
         returns
         -------
-        shifted_offset - offset collapsed to 1D (u.mas)
-        angle          - angle of shift to apply to coupling map (u.deg)
-        ref_angle      - angle of star in 1D axis (u.deg)
+        xshift_pix - how much to shift coupling map in x (axis 1)
+        yshift_pix - how much to shift coupling map in y (axis 0)
         """
+        # define x, y to be offset of coupling map w.r.t fiber, so need to flip sign of offsets
+        x = -xoffset 
+        y = -yoffset
+
         shifted_offset   = np.sqrt(x**2 + y**2)  # mas, from center of field
         if x==0: 
             phi=90 * u.deg
         else:
             phi = np.arctan(y/x) # bc x and y have units, returns radians already
 
+        if x < 0:
+            phi += 180 * u.deg # arctan only gives angles between -90 and 90, need to add 180 if in left half of field
+        
         angle            = phi + theta           # degrees, shifts coupling map
-        ref_angle        = theta                 # this reference angle will differ now
 
-        return shifted_offset, angle.to(u.deg)
+        shifted_offset_pix = shifted_offset  * 1./ self.plate_scale_coupling   # pixels
+        xshift_pix = shifted_offset_pix.decompose().value * np.cos(angle)
+        yshift_pix = shifted_offset_pix.decompose().value * np.sin(angle)
+
+        return xshift_pix, yshift_pix
     
-    def _transform_coupling_map(self, coupling_map, shifted_offset, angle):
+    def _transform_coupling_map(self, coupling_map, xshift_pix, yshift_pix):
         """ apply the shift to the coupling map based on the shifted offset and angle
         """
         # compute the desired shift in image pixel units
-        shifted_offset_pix = shifted_offset  * 1./ self.plate_scale_coupling   # pixels
-
-        # shift coupling map accordingly
-        coupling_map_shifted = shift(coupling_map, [shifted_offset_pix.decompose().value * np.sin(angle), 
-                                                    shifted_offset_pix.decompose().value * np.cos(angle)],mode='wrap')
         
+        # shift coupling map accordingly
+        # shift does FFT but is super slow
+        #coupling_map_shifted = shift(coupling_map, [xshift_pix, yshift_pix],mode='wrap')
+        
+        # try rolling instead
+        coupling_map_shifted = np.roll(coupling_map, xshift_pix, axis=1) # really important apply these to the correct axis
+        coupling_map_shifted = np.roll(coupling_map_shifted, yshift_pix, axis=0)
+
         # make it so coupling maps have same peak value (which gets messed up when shifting)
         unshifted_sum_coupling = np.max(self.coupling_map)
         coupling_map_shifted *= (unshifted_sum_coupling / np.max(coupling_map_shifted))
@@ -297,9 +325,9 @@ class DifferentialLimbCoupling(dlcSettings,
         """
         spec_res_vel =  c.c / self.R # spectrometer resolution 
         spec_kernel_wid = spec_res_vel / self.vel_scale_pix # PSF FWHM in image pixels
-        spec_kernel_sigma = spec_kernel_wid / 2.335 # sigma of gaussian in pixels
-        self.spec_kernel = Gaussian1DKernel(spec_kernel_sigma.decompose().value).array # final kernel
-        print('res vel', spec_res_vel, 'spec kernel wid', spec_kernel_wid)
+        spec_kernel_sigma = spec_kernel_wid.decompose() / 2.335 # sigma of gaussian in pixels
+        self.spec_kernel = Gaussian1DKernel(spec_kernel_sigma.value).array # final kernel
+        print('res vel', np.round(spec_res_vel,1), 'spec kernel wid', np.round(spec_kernel_wid,1))
 
     @u.quantity_input
     def _create_lsf(self, coupling_map):
@@ -336,11 +364,12 @@ class DifferentialLimbCoupling(dlcSettings,
         """
         # get the reference line profile and ccf
         self.vprof_ref, self.ccf_ref = self._create_lsf(self.coupling_map)
-
+        self.vel_ref   = u.pix * self.vel_arr[np.argmin(self.ccf_ref)]
+ 
         self.ccfs_shifted = {}
         self.vprofs_shifted = {}
         self.coupling_maps_shifted = {}
-        vels = np.zeros(len(self.yoffsets)) * u.km / u.s / u.pix
+        vels = np.zeros(len(self.yoffsets)) * u.km / u.s
         for i,yoffset in enumerate(self.yoffsets):
             print('Running x,y position', self.xoffsets[i], yoffset)
             
@@ -352,8 +381,7 @@ class DifferentialLimbCoupling(dlcSettings,
             vprof_shifted, ccf_shifted = self._create_lsf(shifted_coupling_map)
             
             # compute min velocity based on ccf
-            self.vel_ref   = self.vel_arr[np.argmin(self.ccf_ref)]
-            vel_shift = self.vel_arr[np.argmin(ccf_shifted)]
+            vel_shift      = u.pix * self.vel_arr[np.argmin(ccf_shifted)]
             print('vel', vel_shift - self.vel_ref)
             
             # store outputs for this position
@@ -362,7 +390,7 @@ class DifferentialLimbCoupling(dlcSettings,
             self.coupling_maps_shifted[i] = shifted_coupling_map
             vels[i]   = vel_shift - self.vel_ref
 
-        self.vels = vels * u.pix # don't't need the pixels unit
+        self.vels = vels # don't't need the pixels unit
 
         if self.diagnostics_on:
             self.plot_rvs()
@@ -478,7 +506,7 @@ class DifferentialLimbCoupling(dlcSettings,
         def deshift_coupling_map(coupling_map_shifted, xoffset, yoffset, theta):
             """ function to shift the coupling map back to be centered """
             shifted_offset, angle = self._compute_shift(xoffset,yoffset,theta)
-            unshifted_map = self._transform_coupling_map(coupling_map_shifted, -1*shifted_offset, angle)
+            unshifted_map = self._transform_coupling_map(coupling_map_shifted, -shifted_offset, -angle)
             return unshifted_map
         
         # plot de shifted coupling map
@@ -495,7 +523,7 @@ class DifferentialLimbCoupling(dlcSettings,
         unshifted_derotated_map = unshifted_derotated_temp_map[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
         
         # PLOT PANEL 2 - shifted, derotated positions
-        axs[1].imshow(unshifted_derotated_map + self.coupling_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[1].imshow(unshifted_derotated_map + self.coupling_map,cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[1].set_xlabel('X [mas]')
         axs[1].set_title('Offset Stellar Positions')
         axs[1].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1,label='Offset positions')
@@ -509,7 +537,7 @@ class DifferentialLimbCoupling(dlcSettings,
         wz = int(self.coupling_map.shape[0] / 2.)
         unshifted_derotated_map = test[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
 
-        axs[2].imshow(unshifted_derotated_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[2].imshow(unshifted_derotated_map,cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[2].set_xlabel('X [mas]')
         axs[2].set_title('Last Stellar Position')
         axs[2].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1, label='Offset positions')
