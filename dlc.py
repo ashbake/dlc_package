@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 
 from scipy.ndimage import zoom, shift, rotate
+from scipy.optimize import curve_fit
+
 from pathlib import Path
 
 from astropy.convolution import Gaussian1DKernel, convolve
@@ -141,8 +143,11 @@ class DifferentialLimbCoupling(dlcSettings,
         #    coupling_map = ""
         elif self.telescope == 'TMT' or self.telescope == 'Thirty Meter Telescope':
             coupling_file_name = 'staticModel_TMT_HK_defoc0nmRMS_LO0nmRMS_Fnum2.61_atm0_adc0_nWvls10_PL0.fits'
+        elif self.telescope=='Palomar' or self.telescope=='Hale':
+            coupling_file_name = 'staticModel_Keck_yJ_defoc0nmRMS_LO0nmRMS_Fnum3.67_atm0_adc0_nWvls10_PL0.fits'
+            # use keck one for now, but should make a palomar specific one in the future, just use the keck one and scale it to match the plate scale of palomar since the coupling map is in pixel units
         else:
-            raise(Warning, 'Telescope Data not available, options are: Keck, TMT')
+            raise(Warning, 'Telescope Data not available, options are: Keck, TMT, Palomar, Hale')
         
         coupling_map_path = FILEPATH / "data/coupling_maps/" / coupling_file_name
         print(f'Loading {coupling_map_path}')
@@ -155,6 +160,9 @@ class DifferentialLimbCoupling(dlcSettings,
         warr_fits = np.linspace(wstart, wend, nwvls)
 
         self.plate_scale_coupling_raw = fits.getval(coupling_map_path, 'DXMAS') * u.mas / u.pixel# mas per pixel
+        if self.telescope=='Palomar' or self.telescope=='Hale':
+            # scale the plate scale to match palomar's plate scale since using keck coupling map
+            self.plate_scale_coupling_raw *= 3.5 # scale factor to match palomar's plate scale, should make a palomar specific coupling map in the future
 
         # image midpoint
         midpix = int(fits.getval(coupling_map_path, 'NAXIS1') / 2.)
@@ -177,7 +185,7 @@ class DifferentialLimbCoupling(dlcSettings,
         self.plate_scale_coupling = self.plate_scale_coupling_raw / upsamp_fac
 
         if self.diagnostics_on:
-            plt.imshow(self.coupling_map)
+            plt.imshow(self.coupling_map, origin='lower')
             plt.grid()
             plt.title(f'Coupling Map, Plate Scale: {np.round(self.plate_scale_coupling,4)}')
             plt.show()
@@ -358,13 +366,47 @@ class DifferentialLimbCoupling(dlcSettings,
         # these returns are computer per offset position, so don't store individual ones in class
         return vprof, ccf_shifted
 
+    def _find_ccf_min(self, v, ccf, method='fit'):
+        """
+        Find the minimum of the CCF to determine the velocity shift for a given position. This is the RV shift that would be measured for this position.
+
+        inputs
+        ------
+        v - velocity array corresponding to the CCF
+        ccf - the cross-correlation function for the line profile convolved with the spectrometer LSF
+        method - method to find minimum, either 'fit' to fit a parabola to the minimum or 'min' to just take the minimum value (default: 'fit')
+        """
+        # fit ccf vs v to find minimum
+        if method=='fit':
+            # define a parabola function to fit to the CCF around the minimum
+            def parabola(x, a, b, c):
+                return a * (x - b)**2 + c
+
+            # find the index of the minimum value in the CCF
+            min_index = np.argmin(ccf)
+
+            # fit a parabola to the points around the minimum
+            fit_indices = np.arange(min_index-2, min_index+3) # take 5 points around the minimum for fitting
+            popt, _ = curve_fit(parabola, v[fit_indices], ccf[fit_indices])
+
+            # the vertex of the parabola gives the velocity shift
+            a, b, c = popt
+            vel_shift = b * v.unit
+
+        # argmin method
+        if method=='min':
+            min_index = np.argmin(ccf)
+            vel_shift = v[min_index]    
+        
+        return vel_shift
+
     def run(self):
         """ 
         run the DLC simulation with the current settings in the class
         """
         # get the reference line profile and ccf
         self.vprof_ref, self.ccf_ref = self._create_lsf(self.coupling_map)
-        self.vel_ref   = u.pix * self.vel_arr[np.argmin(self.ccf_ref)]
+        self.vel_ref   = self._find_ccf_min(self.vel_arr, self.ccf_ref) * u.pix
  
         self.ccfs_shifted = {}
         self.vprofs_shifted = {}
@@ -381,7 +423,7 @@ class DifferentialLimbCoupling(dlcSettings,
             vprof_shifted, ccf_shifted = self._create_lsf(shifted_coupling_map)
             
             # compute min velocity based on ccf
-            vel_shift      = u.pix * self.vel_arr[np.argmin(ccf_shifted)]
+            vel_shift      = self._find_ccf_min(self.vel_arr, ccf_shifted) * u.pix
             print('vel', vel_shift - self.vel_ref)
             
             # store outputs for this position
@@ -399,7 +441,7 @@ class DifferentialLimbCoupling(dlcSettings,
             #self.plot_star_fiber_raw()
             self.plot_lsf_ccf()
 
-    def plot_star_fiber_raw(self):
+    def plot_star_fiber_raw(self, save_path=None):
         """
         plot the fiber coupling map and overplot the stellar positions with 
         the reference star shown with its velocity map. This is the raw shifted
@@ -409,9 +451,9 @@ class DifferentialLimbCoupling(dlcSettings,
         extent = self.plate_scale_coupling * len(self.stellar_im_vel)
         extent = extent.value
     
-        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
-        axs[1].imshow((self.stellar_im_vel*self.coupling_maps_shifted[0]  + self.coupling_maps_shifted[0]),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
-        axs[2].imshow((self.stellar_im_vel*self.coupling_maps_shifted[len(self.xoffsets)-1]  + self.coupling_maps_shifted[len(self.xoffsets)-1]),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[1].imshow((self.stellar_im_vel*self.coupling_maps_shifted[0]  + self.coupling_maps_shifted[0]),cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[2].imshow((self.stellar_im_vel*self.coupling_maps_shifted[len(self.xoffsets)-1]  + self.coupling_maps_shifted[len(self.xoffsets)-1]),cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
 
         axs[0].set_xlabel('X [mas]')
         axs[0].set_ylabel('Y [mas]')
@@ -429,9 +471,11 @@ class DifferentialLimbCoupling(dlcSettings,
         
         plt.suptitle(f'Star Coupling Maps, As Calculated\ntheta={self.theta}')
 
+        if save_path is not None:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
 
-    def plot_star_fiber_RValigned(self):
+    def plot_star_fiber_RValigned(self, save_path=None):
         """
         plot the fiber coupling map and overplot the stellar positions with the 
         reference star shown with its velocity map. This shifts the coupling map 
@@ -442,7 +486,7 @@ class DifferentialLimbCoupling(dlcSettings,
         extent = extent.value
 
         # PLOT PANEL 0 - reference position
-        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         # rotate xoffset and yoffsets by theta to plot over the reference position
         # the velocity axis is aligned and so the offsets need to be rotated to match the angle of the star
         x_new = self.xoffsets * np.cos(-self.theta) - self.yoffsets * np.sin(-self.theta)
@@ -466,7 +510,7 @@ class DifferentialLimbCoupling(dlcSettings,
             unshifted_temp_map += deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
         
         # PLOT PANEL 2 - shifted, derotated positions
-        axs[1].imshow(unshifted_temp_map + self.coupling_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[1].imshow(unshifted_temp_map + self.coupling_map,cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[1].set_xlabel('X [mas]')
         axs[1].set_title(f'Offset Stellar Positions')
         axs[1].plot(x_new, y_new, marker='x', color='k', alpha=0.1,label='Offset positions')
@@ -476,20 +520,26 @@ class DifferentialLimbCoupling(dlcSettings,
         temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] + self.coupling_maps_shifted[i]
         unshifted_temp_map = deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
 
-        axs[2].imshow(unshifted_temp_map,cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[2].imshow(unshifted_temp_map,cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[2].set_xlabel('X [mas]')
         axs[2].set_title('Last Stellar Position')
         axs[2].plot(x_new, y_new, marker='x', alpha=0.1, color='k', label='Offset positions')
 
         # make super title
         plt.suptitle(f'Star Coupling Maps, RV aligned\ntheta={self.theta}')
+        if save_path is not None:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
 
-    def plot_star_fiber(self):
+    def plot_star_fiber(self, save_path=None):
         """
         plot the fiber coupling map and overplot the stellar positions with the 
         reference star shown with its velocity map. This shifts the coupling map 
         back to be centered and rotate it so the star is at its correct angle
+
+        input
+        -----
+        save_path - if not None, will save the figure to the provided path
         """
         fig, axs = plt.subplots(1,3,figsize=[10,4])
         extent = self.plate_scale_coupling * self.coupling_map.shape[0]
@@ -543,50 +593,69 @@ class DifferentialLimbCoupling(dlcSettings,
         axs[2].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1, label='Offset positions')
 
         plt.suptitle(f'Star Coupling Maps, Natural View\ntheta={self.theta}')
-
+        
+        if save_path is not None:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            
         plt.show()
 
-    def plot_rvs(self, ):
+    def plot_rvs(self, xarr=None, xlabel=None, save_path=None):
         """
         plot the output radial velocities
+
+        inputs
+        ------
+        xarr - array of x values to plot against, if None will just use the index of the velocities
+        save_path - if not None, will save the figure to the provided path
         """
+        if xarr is None:
+            xarr = np.arange(len(self.vels))
+
         fig, ax = plt.subplots()
-        ax.plot(self.yoffsets, self.vels.to(u.km/u.s), marker='o')
-        ax.set_xlabel('Position [mas]')
+        ax.plot(xarr, self.vels.to(u.km/u.s), marker='o')
+        if xlabel is not None:
+            ax.set_xlabel(xlabel)
+        else:
+            ax.set_xlabel('Measurement Index')
         ax.set_ylabel('Velocity offset [km/s]')
         ax.set_title(f'{self.telescope} DLC Simulation, theta={self.theta}')
         ax.grid()
+
+        if save_path is not None:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            
         plt.show()
 
-    def plot_lsf_ccf(self,index=0):
+    def plot_lsf_ccf(self,index=0, save_path = None):
         """
         plot the line spread function and ccf for the reference and one of the shifted positions to visualize how the RV shift is happening
 
         inputs
         ------
         index - which shifted position to plot (default: 0)
+        save_path - if not None, will save the figure to the provided path
         """
         # PLot the stellar profile and that convolved with the instrument profile
         import matplotlib.patheffects as pe
 
-        ref_color = 'tab:gray'
-        shifted_color = 'tab:purple'
+        ref_color = 'white'
+        shifted_color = 'purple'
+        shifted_ccf_color = 'steelblue'
 
-        fig, axs = plt.subplots(2,1,figsize=[8, 5], sharex=True)
+        fig, axs = plt.subplots(2,1,figsize=[6, 5], sharex=True, sharey=True)
 
         # Plot the stellar velocity profile (vprof)
-        axs[0].plot(self.vel_arr/self.vsini, self.vprof_ref, '-.', color=ref_color, label='On-axis',lw=5)
-        axs[0].plot(self.vel_arr/self.vsini, self.vprofs_shifted[index], '-', label='Off-axis',lw=5,color=shifted_color)
+        axs[0].plot(self.vel_arr/self.vsini, self.vprof_ref, '-', color=ref_color, label='On-axis',lw=5)
+        axs[0].plot(self.vel_arr/self.vsini, self.vprofs_shifted[index], '-.', label='Off-axis',lw=5,color=shifted_color)
 
         # plot the stellar velocity profile convolved with the instrument profile (CCF)
-        axs[1].plot(self.vel_arr/self.vsini, self.ccf_ref, '-.', label='On-axis CCF',lw=5,color=ref_color)
-        axs[1].plot(self.vel_arr/self.vsini, self.ccfs_shifted[index], '-', label='Off-axis CCF',lw=5,color=shifted_color)
+        axs[1].plot(self.vel_arr/self.vsini, self.ccf_ref, '-', label='On-axis CCF',lw=5,color=ref_color)
+        axs[1].plot(self.vel_arr/self.vsini, self.ccfs_shifted[index], '-.', label='Off-axis CCF',lw=5,color=shifted_ccf_color)
         
         # plot the bestfit velocity as a vertical line
-        vel_ref   = self.vel_arr[np.argmin(self.ccf_ref)]
-        axs[1].axvline((self.vels[index] + vel_ref * u.pix)/self.vsini, color=shifted_color, alpha=0.3)
-        axs[1].axvline(self.vel_ref * u.pix/self.vsini, color=ref_color, alpha=0.3)
-
+        vel_ref   = self.vel_arr[np.argmin(self.ccf_ref)] * u.pix
+        axs[1].axvline((self.vels[index] + vel_ref)/self.vsini, color=shifted_ccf_color, alpha=0.6)
+        axs[1].axvline(self.vel_ref/self.vsini, color=ref_color, alpha=0.6)
 
         axs[0].set_xlim(-2., 2.)
         axs[0].legend(loc='best',handlelength=2,handletextpad=0.5)#,ncols=2)
@@ -597,6 +666,9 @@ class DifferentialLimbCoupling(dlcSettings,
         axs[1].set_title('CCF profile')
         axs[1].set_ylabel('Relative Intensity')
         axs[1].legend(loc='best',handlelength=2,handletextpad=0.5)#,ncols=2)
+
+        if save_path is not None:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
         plt.show()
 

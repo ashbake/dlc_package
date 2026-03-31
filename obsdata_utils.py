@@ -105,7 +105,8 @@ class cObsLog():
                 bcs[i] = get_BC(source_name=self.target[i], obstime=hdr['TIMEWMJD'], format='mjd',obsname='Palomar')
                 weighted_times[i] = hdr['TIMEWMJD']
             except FileNotFoundError:
-                pass
+                bcs[i] = np.nan
+                weighted_times[i] = np.nan
 
         self.obs_data['bcs'] = bcs
         self.obs_data['weighted_times'] = weighted_times
