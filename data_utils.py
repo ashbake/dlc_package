@@ -6,7 +6,7 @@ import sys
 
 from barycorrpy import get_BC_vel
 from astropy.time import Time
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, AltAz, EarthLocation
 
 
 # from pathlib import Path
@@ -22,10 +22,10 @@ from astropy.coordinates import SkyCoord
 # obslog = cObsLog(excel_file)
 
 
-def get_BC(source_name="MuGem", obstime=None, format='mjd', obsname='Palomar'):
+def get_BC(ra, dec, obstime=None, format='mjd', obsname='Palomar'):
     """
-    source_name: star common name
-    obstime: observation time string (from TIMEWMJD)
+    ra, dec: target coordinates in degrees
+    obstime: observation time string that matches the specified format
     format: format of obstime for loading with Astropy
     obsname: observatory name
 
@@ -33,17 +33,15 @@ def get_BC(source_name="MuGem", obstime=None, format='mjd', obsname='Palomar'):
     ------
     bc_vel 
     """
-    # Get target coordinates
-    target = SkyCoord.from_name(source_name)
-
+    # Get target coordinates - careful querying with source name
     # Your observation
     #obstime = Time('2025-10-20T10:30:00', scale='utc')
     obstime = Time(obstime,format=format)
     # Calculate correction
     bc_vel, warning, status = get_BC_vel(
         JDUTC=obstime.jd,
-        ra=target.ra.deg,
-        dec=target.dec.deg,
+        ra=ra,
+        dec=dec,
         obsname=obsname,
         ephemeris='de430',
         leap_update=True
@@ -54,6 +52,36 @@ def get_BC(source_name="MuGem", obstime=None, format='mjd', obsname='Palomar'):
     #print(f"Barycentric correction: {bc_vel} m/s ({bc_vel/1000} km/s)")
 
     return bc_vel
+
+def get_PA(ra, dec, obstime=None, format='mjd', obsname='Palomar'):
+    """
+    ra, dec: target coordinates in degrees
+    obstime: observation time string (from TIMEWMJD)
+    format: format of obstime for loading with Astropy
+    obsname: observatory name
+
+    output
+    ------
+    parallactic angle in degrees
+    """
+    # Get target coordinates
+    # Get target coordinates - careful querying with source name
+    target = SkyCoord(ra=ra, dec=dec, unit='deg') # overwrite with input coordinates, in case name doesn't resolve or is different
+
+    # Your observation
+    obstime = Time(obstime,format=format)
+    loc = EarthLocation.of_site(obsname)
+    
+    # get alt az of target
+    altaz = AltAz(location=loc, obstime=obstime)
+    target_altaz = target.transform_to(altaz)
+    
+    # Calculate Field Rotation (Parallactic Angle)
+    pa = target_altaz.parallactic_angle
+
+    return pa.deg
+
+
 
 def load_all_spectra(target, norder,extension=1,plot=False):
     """

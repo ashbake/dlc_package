@@ -59,16 +59,97 @@ class StellarModel():
         pass
 
 
-class AOJitter():
+class AtmEffects():
+    """Atmospheric effects like jitter and DAR that can be added to the DLC simulation"""
     def __init__(self,):
         pass
+    
+    @u.quantity_input
+    def generate_jitter(self,
+                        r_in: u.mas,
+                        r_out: u.mas,
+                        sigma: u.mas,
+                        exp_time: u.s):
+        """generate a scanning or tip/tilt residual pattern based on the time scale of the jitter and the exposure time
+        
+        inputs
+        ------
+        r_in - inner radius of jitter pattern (u.mas)
+        r_out - outer radius of jitter pattern (u.mas)
+        sigma - width of jitter pattern (u.mas) - if this is >0 specified along with r_in and r_out, will put jitter on top of scanning pattern
+        exp_time - exposure time of observation (u.s)
 
-    def generate_jitter(self, tt_dyn):
-        """generate a jitter pattern based on the time scale of the jitter and the exposure time"""
-        pass
+        returns
+        -------
+        x_jitter - array of x offsets for jitter pattern (u.mas)
+        y_jitter - array of y offsets for jitter pattern (u.mas)
+        """
+        # determine number of samples to take based on exposure time and typical jitter timescale (e.g. 1s for tip/tilt residuals, 10s for scanning pattern)
+        jitter_timescale = 10 * u.ms # typical atmospheric change timescale
+        scanning_timescale = 1 * u.s # assumed scanning pattern timescale, this is based on pattern given to DM since it's injected
 
-    def DAR(self):
-        """compute the DAR shift based on the zenith angle and wavelength range of the observation"""
+        nsamples_jitter = int(exp_time / jitter_timescale)
+        nsamples_scanning = int(exp_time / scanning_timescale)
+
+        if (r_in == 0 * u.mas) and (r_out == 0 * u.mas) and (sigma > 0*u.mas):
+            # generate pure jitter pattern with Gaussian distribution
+            x_jitter = np.random.normal(0, sigma.value, size=nsamples_jitter) * sigma.unit
+            y_jitter = np.random.normal(0, sigma.value, size=nsamples_jitter) * sigma.unit
+        
+        elif (r_out > 0 * u.mas) and (sigma == 0 * u.mas):
+            # generate pure scanning pattern with uniform distribution between r_in and r_out
+            angles = np.random.uniform(0, 2*np.pi, size=nsamples_scanning)
+            radii = np.random.uniform(r_in.value, r_out.value, size=nsamples_scanning) * r_in.unit
+            x_jitter = radii * np.cos(angles)
+            y_jitter = radii * np.sin(angles)
+        
+        elif  (r_out > 0 * u.mas) and (sigma > 0 * u.mas):
+            # generate scanning pattern with jitter on top
+            angles = np.random.uniform(0, 2*np.pi, size=nsamples_scanning)
+            radii = np.random.uniform(r_in.value, r_out.value, size=nsamples_scanning) * r_in.unit
+            x_jitter = radii * np.cos(angles) + np.random.normal(0, sigma.value, size=nsamples_scanning) * sigma.unit
+            y_jitter = radii * np.sin(angles) + np.random.normal(0, sigma.value, size=nsamples_scanning) * sigma.unit 
+
+        else:
+            raise ValueError("Invalid combination of jitter parameters. Must specify either r_in and r_out for scanning pattern, sigma for pure jitter pattern, or all three for scanning with jitter.")
+
+        return x_jitter, y_jitter
+    
+    def generate_scanning_pattern(self, radius: u.mas, n_points: int):
+        """generate a scanning pattern for the star to follow during the exposure, this is a type of jitter but on a longer timescale and with a specific pattern
+
+        inputs
+        ------
+        radius -  radius of scanning pattern (u.mas)
+        n_points - number of points in the scanning pattern
+
+        returns
+        -------
+        x_scanning - array of x offsets for scanning pattern (u.mas)
+        y_scanning - array of y offsets for scanning pattern (u.mas)
+        """
+        # generate a circular scanning pattern
+        angles = np.linspace(0, 2*np.pi, n_points, endpoint=False)
+        x_scanning = radius * np.cos(angles)
+        y_scanning = radius * np.sin(angles)
+
+        return x_scanning, y_scanning
+    
+    def DAR(self,
+            lam_guide: u.nm,
+            axis: str):
+        """compute the DAR shift based on the zenith angle and wavelength range of the observation
+        TODO determine how wavelength dependence of the coupling map comes into play
+        
+        inputs
+        ------
+        lam_guide - wavelength of the guide camera (u.nm)
+        axis - axis to apply DAR shift to, either 'x' or 'y'
+        
+        returns
+        -------
+        dar_shift - the shift to apply to the coupling map for DAR (u.mas)
+        """
         pass
 
 
@@ -79,6 +160,8 @@ class dlcSettings():
     # telescope [str] default: Keck - string name of telescope to load coupling maps for
     #    options: Keck, Hale, or TMT
     telescope: str = 'Keck'
+    bandpass: str = 'yJ' # wavelength for coupling map, only relevant if loading coupling maps with multiple wavelengths, for now just load one wavelength per telescope so not used but should add to config if adding more coupling maps in the future
+    coupling_map_boundary: float = 50 * u.mas # mas, max offset from center of coupling map before hitting edge, important to set this based on the coupling map size to avoid getting garb results when shifting the coupling map beyond its boundaries
 
     # R  [float] default: 100000 - resolving power of instrument
     R: float = 100_000
@@ -89,7 +172,7 @@ class dlcSettings():
     yoffsets: list = field(default_factory=lambda: [0, 0] * u.mas)
 
     # Jitter
-    tt_dyn: float = 0*u.mas
+    tt_dyn: list = field(default_factory=lambda: [0, 0] * u.mas) 
 
     # STAR
     vsini: float = 2 * u.km / u.s
@@ -101,7 +184,7 @@ class dlcSettings():
 
 class DifferentialLimbCoupling(dlcSettings,
                                StellarModel,
-                               AOJitter):
+                               AtmEffects):
     """        
     inputs:
     ------
@@ -138,13 +221,22 @@ class DifferentialLimbCoupling(dlcSettings,
             loads plate scale for the coupling map
         """
         if self.telescope=='Keck':
-            coupling_file_name = 'staticModel_Keck_HK_defoc0nmRMS_LO0nmRMS_Fnum2.63_atm0_adc0_nWvls10_PL0.fits'
+            if self.bandpass=='yJ':
+                coupling_file_name = 'staticModel_Keck_yJ_defoc0nmRMS_LO0nmRMS_Fnum3.67_atm0_adc0_nWvls10_PL0.fits' 
+            elif self.bandpass =='HK':
+                coupling_file_name = 'staticModel_Keck_HK_defoc0nmRMS_LO0nmRMS_Fnum2.63_atm0_adc0_nWvls10_PL0.fits'
         #elif telescope=='Hale':
         #    coupling_map = ""
         elif self.telescope == 'TMT' or self.telescope == 'Thirty Meter Telescope':
-            coupling_file_name = 'staticModel_TMT_HK_defoc0nmRMS_LO0nmRMS_Fnum2.61_atm0_adc0_nWvls10_PL0.fits'
+            if self.bandpass=='yJ': 
+                coupling_file_name = 'staticModel_TMT_yJ_defoc0nmRMS_LO0nmRMS_Fnum3.63_atm0_adc0_nWvls10_PL0.fits'
+            elif self.bandpass =='HK':
+                coupling_file_name = 'staticModel_TMT_HK_defoc0nmRMS_LO0nmRMS_Fnum2.61_atm0_adc0_nWvls10_PL0.fits'
+            else:
+                raise ValueError("Invalid bandpass for TMT coupling map. Options are 'yJ' or 'HK'.")
         elif self.telescope=='Palomar' or self.telescope=='Hale':
             coupling_file_name = 'staticModel_Keck_yJ_defoc0nmRMS_LO0nmRMS_Fnum3.67_atm0_adc0_nWvls10_PL0.fits'
+            raise(Warning, 'Loading Keck coupling map for Palomar/Hale in yJ band, - scaling plate scale to match Palomar since using Keck coupling map, should make a Palomar specific coupling map in the future')
             # use keck one for now, but should make a palomar specific one in the future, just use the keck one and scale it to match the plate scale of palomar since the coupling map is in pixel units
         else:
             raise(Warning, 'Telescope Data not available, options are: Keck, TMT, Palomar, Hale')
@@ -167,15 +259,16 @@ class DifferentialLimbCoupling(dlcSettings,
         # image midpoint
         midpix = int(fits.getval(coupling_map_path, 'NAXIS1') / 2.)
 
-        # zoom in image size for coupling map
-        wz = 200
+        # zoom in image size for coupling map - dermine zoom based on self.coupling_map_boundary
+        wz = self.coupling_map_boundary / self.plate_scale_coupling_raw
+        wz = int(wz.decompose().value)
 
         # load in central chunk of coupling map (makes the image processing faster later)
-        self.coupling_map_raw = fits.getdata(coupling_map_path)[map_ext][midpix-wz:midpix+wz, midpix-wz:midpix+wz]
+        self.coupling_map_raw = fits.getdata(coupling_map_path)[map_ext]
 
         # upsample the coupling map by a factor of N
         upsamp_fac = 10 # upsample factor
-        self.coupling_map = zoom(self.coupling_map_raw , upsamp_fac, cval=0,order=3,grid_mode=False)
+        self.coupling_map = zoom(self.coupling_map_raw[midpix-wz:midpix+wz, midpix-wz:midpix+wz] , upsamp_fac, cval=0,order=3,grid_mode=False)
         self.gridsize = self.coupling_map.shape[0]
 
         #print(np.argmax(np.nansum(coupling_map_upsampled,axis=1)))
@@ -323,6 +416,8 @@ class DifferentialLimbCoupling(dlcSettings,
         stellar_im_vel = plane_image * im_mask_int * im_intensity
         stellar_im_vel /= np.nanmax(stellar_im_vel)
         
+        self.im_mask_int = im_mask_int
+        
         # store important variables
         self.im_intensity, self.vel_arr, self.stellar_im_vel, self.vel_scale_pix = im_intensity, vel_arr, stellar_im_vel, vel_scale_pix
     
@@ -411,13 +506,14 @@ class DifferentialLimbCoupling(dlcSettings,
         self.ccfs_shifted = {}
         self.vprofs_shifted = {}
         self.coupling_maps_shifted = {}
+        self.coupling_efficiency = {}
         vels = np.zeros(len(self.yoffsets)) * u.km / u.s
         for i,yoffset in enumerate(self.yoffsets):
             print('Running x,y position', self.xoffsets[i], yoffset)
             
             # compute shifted coupling map
             shifted_offset, angle = self._compute_shift(self.xoffsets[i],yoffset,self.theta)
-            shifted_coupling_map = self._transform_coupling_map(self.coupling_map, shifted_offset, angle)
+            shifted_coupling_map  = self._transform_coupling_map(self.coupling_map, shifted_offset, angle)
             
             # compute vprof and ccf for shifted position
             vprof_shifted, ccf_shifted = self._create_lsf(shifted_coupling_map)
@@ -431,6 +527,7 @@ class DifferentialLimbCoupling(dlcSettings,
             self.vprofs_shifted[i] = vprof_shifted
             self.coupling_maps_shifted[i] = shifted_coupling_map
             vels[i]   = vel_shift - self.vel_ref
+            self.coupling_efficiency[i] = np.nanmean(shifted_coupling_map[np.where(self.im_mask_int==1)])
 
         self.vels = vels # don't't need the pixels unit
 
@@ -440,6 +537,77 @@ class DifferentialLimbCoupling(dlcSettings,
             #self.plot_star_fiber_RValigned()
             #self.plot_star_fiber_raw()
             self.plot_lsf_ccf()
+
+    def run_ttjitter(self, exp_time=90*u.s, r_in=0 * u.mas, r_out=0 * u.mas, perfect_scan=False):
+        """ 
+        run the DLC simulation with tip/tilt jitter added to the star position. 
+        This will create a jitter pattern based on the settings in the class and 
+        apply it to the star position for each offset position, then compute the 
+        line profiles, ccfs, and velocity shifts for each jittered position. The 
+        final velocity shift for each offset position will be the average of the 
+        velocity shifts for all the jittered positions.
+        """
+        # get the reference line profile and ccf
+        self.vprof_ref, self.ccf_ref = self._create_lsf(self.coupling_map)
+        self.vel_ref   = self._find_ccf_min(self.vel_arr, self.ccf_ref) * u.pix
+ 
+        self.ccfs_shifted = {}
+        self.vprofs_shifted = {}
+        self.coupling_maps_shifted = {}
+        self.x_jitter = {}
+        self.y_jitter = {}
+        self.coupling_efficiency = {}
+        vels = np.zeros(len(self.yoffsets)) * u.km / u.s
+        for i,yoffset in enumerate(self.yoffsets):
+            print('Running x,y position', self.xoffsets[i], yoffset)
+
+            # generate jitter pattern for this position
+            # if perfect_scan is true, ignore the tt_dyn settings and generate a perfect scanning pattern with no jitter on top, this is to test the effect of a perfect scanning pattern without any additional jitter
+            if not perfect_scan: x_jitter, y_jitter = self.generate_jitter(r_in, r_out, self.tt_dyn[i], exp_time=exp_time) # for pure tip/tilt
+            if perfect_scan: x_jitter, y_jitter = self.generate_scanning_pattern(r_in, 20)
+            
+            # save jitter to plot later if want
+            self.x_jitter[i] = x_jitter
+            self.y_jitter[i] = y_jitter
+
+            shifted_coupling_map = np.zeros_like(self.coupling_map)
+            
+            for x_jitter_i, y_jitter_i in zip(x_jitter, y_jitter):
+                if x_jitter_i > self.coupling_map_boundary or y_jitter_i > self.coupling_map_boundary:
+                    raise ValueError(f"Jitter offset {x_jitter_i}, {y_jitter_i} exceeds coupling map boundary of {self.coupling_map_boundary}. Adjust jitter parameters or increase coupling map size.")
+                # compute shifted coupling map
+                shifted_offset, angle = self._compute_shift(self.xoffsets[i] + x_jitter_i,yoffset + y_jitter_i,self.theta)
+                shifted_coupling_map += self._transform_coupling_map(self.coupling_map, shifted_offset, angle)
+            
+            shifted_coupling_map /= len(x_jitter) # average over jitter pattern - effectively smooths the coupling map
+
+            # compute vprof and ccf for shifted position
+            vprof_shifted, ccf_shifted = self._create_lsf(shifted_coupling_map)
+            #plt.figure('test')
+            #plt.plot(ccf_shifted)
+            
+            # compute min velocity based on ccf
+            vel_shift      = self._find_ccf_min(self.vel_arr, ccf_shifted) * u.pix
+            print('vel', vel_shift - self.vel_ref)
+            
+            # store outputs for this position
+            self.ccfs_shifted[i] = ccf_shifted
+            self.vprofs_shifted[i] = vprof_shifted
+            self.coupling_maps_shifted[i] = shifted_coupling_map
+            vels[i]   = vel_shift - self.vel_ref
+            #self.coupling_efficiency[i] = np.nansum(shifted_coupling_map * self.im_intensity) / np.nansum(self.coupling_map * self.im_intensity)
+            
+            self.coupling_efficiency[i] = np.nanmean(shifted_coupling_map[np.where(self.im_mask_int==1)])
+          
+        self.vels = vels # don't't need the pixels unit
+
+        if self.diagnostics_on:
+            self.plot_rvs()
+            self.plot_star_fiber()
+            #self.plot_star_fiber_RValigned()
+            #self.plot_star_fiber_raw()
+            self.plot_lsf_ccf()
+
 
     def plot_star_fiber_raw(self, save_path=None):
         """
@@ -619,7 +787,7 @@ class DifferentialLimbCoupling(dlcSettings,
             ax.set_xlabel('Measurement Index')
         ax.set_ylabel('Velocity offset [km/s]')
         ax.set_title(f'{self.telescope} DLC Simulation, theta={self.theta}')
-        ax.grid()
+        ax.grid(alpha=0.5)
 
         if save_path is not None:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
