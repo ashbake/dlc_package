@@ -3,6 +3,7 @@
 import numpy as np
 import matplotlib.pylab as plt
 import yaml
+from pathlib import Path
 from astropy.io import fits
 import pandas as pd
 from astropy.time import Time
@@ -15,26 +16,34 @@ class cObsLog():
     def __init__(self,
                  excel_file: str,
                  data_path: str | None,
-                 rv_file: str = '_data/MuGem/MuGem_rv_unbin.csv'):
-        
-        self.loadObsLog(excel_file)
-        
+                 rv_file: str | None = None,
+                 target: str | None = None):
+
+        self.loadObsLog(excel_file, target=target)
+
         self.get_gcam_data()
-        
+
+        if rv_file is None:
+            rv_file = self.find_rv_file(data_path)
         self.get_RV_data(rv_file)
 
         if data_path is not None:
             self.get_meta_data(data_path)
 
 
-    def loadObsLog(self,excel_file):
+    def loadObsLog(self,excel_file,target=None):
         """
-        load observation log 
+        load observation log
 
         inputs
         ------
         excel_file - name and location to the observation log
             first sheet should be the main observing log
+        target - optional target name, e.g. 'MuGem'
+            if given, only that target's rows are kept. the obs log holds every
+            target but data_path points at a single target's directory, so
+            without this the other targets' spectra are searched for in the
+            wrong place
 
         outputs:
         --------
@@ -43,8 +52,15 @@ class cObsLog():
         self.xl = pd.ExcelFile(excel_file)
         #sheet_names = xl.sheet_names
 
-        # parse main sheet in obs log, will add info to this 
+        # parse main sheet in obs log, will add info to this
         self.obs_data = self.xl.parse('DLC Targets') # first sheet is the DLC main data log!!!
+
+        if target is not None:
+            self.obs_data = self.obs_data[self.obs_data['target'] == target]
+            if len(self.obs_data) == 0:
+                raise ValueError(f'no observations of target {target} in {excel_file}')
+            # later loops index positionally with .loc, so labels must be 0..n-1
+            self.obs_data = self.obs_data.reset_index(drop=True)
 
         # pull out the OG info into variables
         self.target    = self.obs_data['target']
@@ -102,16 +118,54 @@ class cObsLog():
         self.obs_data['strehl'] = self.strehl[0]
         self.obs_data['jitter'] = self.jitter[0]
 
-    def get_RV_data(self, rv_file='_data/MuGem/MuGem_rv_unbin.csv'):
+    def find_rv_file(self, data_path):
+        """
+        locate the serval RV file for this target
+
+        the RV csv sits alongside the spectra in the target's data directory,
+        e.g. _data/MuGem/MuGem_rv_unbin.csv
+
+        returns the path as a string, or None if data_path is not given or no
+        RV file is there
+        """
+        if data_path is None:
+            return None
+
+        data_path = Path(data_path)
+
+        # prefer the file named after the target directory, e.g. MuGem/MuGem_rv_unbin.csv
+        rv_file = data_path / f'{data_path.name}_rv_unbin.csv'
+        if rv_file.is_file():
+            return str(rv_file)
+
+        matches = sorted(data_path.glob('*_rv_unbin.csv'))
+        if len(matches) == 0:
+            return None
+        if len(matches) > 1:
+            print(f'Warning: multiple RV files in {data_path}, using {matches[0].name}')
+        return str(matches[0])
+
+    def get_RV_data(self, rv_file):
         """
         open RV data file and merge with obs log
+        if file not found, set RVs to nan and print warning
         """
-        self.rv_data = pd.read_csv(rv_file)
-
         # merge with obs log based on matching specfile names, add RVs to obs log
         self.obs_data['serval_RV'] = np.zeros(len(self.obs_data.specfile)) + np.nan
         self.obs_data['serval_RVerr'] = np.zeros(len(self.obs_data.specfile)) + np.nan
         self.obs_data['serval_berv'] = np.zeros(len(self.obs_data.specfile)) + np.nan
+
+        if rv_file is None:
+            print('Warning: no RV file found for this target, serval RVs set to nan')
+            self.rv_data = None
+            return
+
+        if not Path(rv_file).is_file():
+            print(f'Warning: RV file {rv_file} not found, serval RVs set to nan')
+            self.rv_data = None
+            return
+
+        self.rv_data = pd.read_csv(rv_file)
 
         for i,filename in enumerate(self.rv_data['filename']):
             fname = filename.split('/')[-1]

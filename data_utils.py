@@ -35,6 +35,7 @@ def get_BC(ra, dec, obstime=None, format='mjd', obsname='Palomar'):
     """
     # Get target coordinates - careful querying with source name
     # Your observation
+    #coord = SkyCoord.from_name("M31")
     #obstime = Time('2025-10-20T10:30:00', scale='utc')
     obstime = Time(obstime,format=format)
     # Calculate correction

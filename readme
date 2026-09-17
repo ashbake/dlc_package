@@ -1,0 +1,292 @@
+# dlc_package
+
+Simulates the **differential limb coupling** (DLC) effect: the spurious radial velocity
+signal that appears when a rotating star is imperfectly centred on a single-mode fiber.
+Because the fiber's coupling efficiency varies across the stellar disc, an off-axis star
+has one limb coupled more strongly than the other. The limbs carry opposite rotational
+velocities, so the weighting skews the observed line profile and shifts the measured RV.
+
+The package also includes helpers for loading and cross-matching the PARVI observation
+logs and spectra used to look for this effect in real data.
+
+## How the simulation works
+
+For each star-to-fiber offset, `DifferentialLimbCoupling.run()` does the following:
+
+1. **Load a coupling map** (`_loadCouplingMap`) — a FITS model of fiber coupling
+   efficiency vs. sky position for the chosen telescope and bandpass. A central region
+   of half-width `coupling_map_boundary` is cropped out and upsampled 10x.
+2. **Build the star** (`_create_star_image`) — a limb-darkened disc (quadratic law,
+   coefficients 0.9, 0.4) of angular `diameter`, plus a 2D velocity map giving each
+   pixel its projected rotational velocity, scaled by `vsini`.
+3. **Shift the coupling map** (`_compute_shift`, `_transform_coupling_map`) — move the
+   map by the offset, rotated by `theta`, the on-sky angle of the stellar spin axis.
+   The shift is done with `np.roll` in the upsampled pixel grid.
+4. **Integrate the line profile** (`_create_lsf`) — multiply the stellar intensity by
+   the shifted coupling map, collapse along the velocity axis, invert to get an
+   absorption profile, then convolve with a Gaussian instrument LSF of width `c / R`.
+5. **Measure the RV** (`_find_ccf_min`) — fit a parabola to the five points around the
+   CCF minimum and take the vertex. The reported velocity is this minus the on-axis
+   reference, so a perfectly centred star gives exactly zero by construction.
+
+`run_ttjitter()` wraps the same pipeline but averages many coupling maps over a tip/tilt
+or scanning pattern within one exposure, which is what a real observation integrates over.
+
+## Layout
+
+```
+dlc.py              the simulation. DifferentialLimbCoupling is the entry point
+obsdata_utils.py    cObsLog: reads the observation log spreadsheet, merges guider
+                    positions, serval RVs and FITS header metadata
+data_utils.py       get_BC (barycentric correction), get_PA, load_all_spectra
+configs/            example yaml config
+data/coupling_maps/ FITS coupling models for Keck and TMT, yJ and HK
+examples/           worked notebooks and scripts (see below)
+```
+
+There is no `setup.py`. Add the package directory to the path:
+
+```python
+import sys
+sys.path.insert(0, '/path/to/dlc_package')
+from dlc import DifferentialLimbCoupling as dlc_class
+```
+
+Dependencies: `numpy`, `scipy`, `astropy`, `matplotlib`, `flatstar`, `pyyaml`,
+plus `pandas` and `barycorrpy` for the observation-log utilities.
+
+## Usage
+
+### 1. RV bias vs. static offset
+
+The simplest run: put the star at a few positions and ask what RV error results.
+
+```python
+import astropy.units as u
+from dlc import DifferentialLimbCoupling as dlc_class
+
+dlcc = dlc_class(config=dict(
+    xoffsets = [0, 5, 10, 15],   # mas, star position w.r.t. fiber
+    yoffsets = [0, 0,  0,  0],
+    vsini    = 5 * u.km/u.s,
+    diameter = 10 * u.mas,
+    theta    = 0 * u.deg,        # on-sky angle of the stellar spin axis
+    R        = 100_000,
+    telescope= 'Keck',
+    coupling_map_boundary = 30 * u.mas,
+))
+dlcc.run()
+
+print(dlcc.vels.to(u.m/u.s))       # RV offset at each position
+print(dlcc.coupling_efficiency)    # mean coupling over the stellar disc, per position
+```
+
+`xoffsets` and `yoffsets` are paired element-wise, so they must be the same length —
+the code iterates over positions, it does not form a grid.
+
+### 2. Scanning rings and tip/tilt jitter
+
+`run_ttjitter()` averages the coupling map over an intra-exposure pattern. Three modes,
+selected by which arguments you give:
+
+| pattern | how to get it |
+|---|---|
+| pure Gaussian jitter | `r_in=0`, `r_out=0`, and `tt_dyn > 0` in the config |
+| uniform annulus | `r_out > 0` with `tt_dyn = 0` |
+| annulus + jitter | `r_out > 0` with `tt_dyn > 0` |
+| single exact ring | `perfect_scan=True` (uses `r_in` as the ring radius) |
+
+```python
+# RV bias and coupling efficiency vs. scan ring diameter, for a star held 1 mas
+# off the fiber. keep one offset so vels[0] is the position you care about -- a
+# scan centred at 0,0 averages to zero bias by symmetry and tells you nothing
+dlcc = dlc_class(config=dict(
+    xoffsets = [1], yoffsets = [0], tt_dyn = [0],
+    vsini = 1 * u.km/u.s, diameter = 1.0 * u.mas, R = 90_000,
+    telescope = 'Keck', coupling_map_boundary = 60 * u.mas,
+))
+
+for d_in in [0, 10, 20, 30, 40, 50]:
+    dlcc.run_ttjitter(exp_time=500*u.s, r_in=d_in/2 * u.mas, perfect_scan=True)
+    print(d_in, 1000*dlcc.vels[0].value, dlcc.coupling_efficiency[0])
+```
+
+Scanning trades coupling efficiency for RV stability, and the bias changes sign as the
+ring widens, so there is a diameter where it nulls. For the settings above that happens
+near 39 mas:
+
+```
+d_in (mas)    0       10      20      30      40      50
+RV (m/s)   -0.543  -0.519  -0.437  -0.270  +0.060  +0.828
+coupling    0.642   0.597   0.479   0.325   0.180   0.073
+```
+
+Be aware that `perfect_scan=True` takes a different code path that reads **only**
+`r_in` — it lays down 20 evenly spaced points at exactly that radius. `r_out` and
+`exp_time` are accepted but ignored in that mode. For the realistic annulus use
+`perfect_scan=False`, where `exp_time` sets the number of samples drawn.
+
+### 3. Driving it from an observation log
+
+`cObsLog` reads the observation spreadsheet, keeps one target, merges in the measured
+guider positions, serval RVs and FITS header metadata, and computes barycentric
+corrections.
+
+```python
+import numpy as np
+from obsdata_utils import cObsLog
+
+target = 'MuGem'
+obslog = cObsLog('_data/PARVIRVBiasObservationSummary.xlsx',
+                 f'_data/{target}/',
+                 target=target)       # pass target, the log holds all of them
+obslog.select_by_date('20250227')     # result lands in obslog.obs_data_subset
+s = obslog.obs_data_subset
+
+# rows with no guider solution are filled with -99, drop them first
+ifinite = np.where((s.xpos_meas > -99) & (s.ypos_meas > -99))[0]
+
+guide_platescale = 36.7               # mas/pix
+xoffsets = guide_platescale * s.xpos_meas.values[ifinite]
+yoffsets = guide_platescale * s.ypos_meas.values[ifinite]
+mjds     = s.obstime_bjd.values[ifinite]
+
+# xpos_meas is an absolute guider position, so subtract the mean of the frames
+# that were commanded to 0,0 to get an offset relative to the fiber
+icentered = np.where((s.xpos.values[ifinite] == 0) & (s.ypos.values[ifinite] == 0))[0]
+xoffsets -= guide_platescale * np.mean(s.xpos_meas.values[ifinite][icentered])
+yoffsets -= guide_platescale * np.mean(s.ypos_meas.values[ifinite][icentered])
+```
+
+Two things to watch here. `xpos_meas`/`ypos_meas` are **absolute** guider positions in
+pixels — for MuGem 2025-02-27 they span 510-640 mas — so the subtraction of the centred
+reference is what turns them into fiber offsets. And missing guider solutions are stored
+as `-99`, which becomes a -3633 mas offset if you don't filter them out.
+
+Pass `target=` to the constructor. Without it every target in the spreadsheet is
+retained and their spectra are searched for inside the one directory you gave,
+producing a wall of "did not find file" warnings.
+
+Index positionally with `.values[...]` rather than `s.xpos_meas[ifinite]`. The subset is
+a filtered slice, so a bare integer index on the Series is a *label* lookup and will
+pick the wrong rows whenever the labels aren't already 0..n-1.
+
+### 4. YAML config and saving plots
+
+Any setting can come from a yaml file instead of a dict:
+
+```python
+dlcc = dlc_class(config='configs/gen_config.yaml')
+```
+
+Set `save_path` to have every plot written to that folder automatically. The folder is
+created if it doesn't exist; if `save_path` is unset, plots are shown but never written.
+
+```python
+dlcc = dlc_class(config=dict(..., save_path='./plots'))
+dlcc.run()
+dlcc.plot_rvs()          # -> ./plots/rvs.png
+dlcc.plot_star_fiber()   # -> ./plots/star_fiber.png
+dlcc.plot_lsf_ccf()      # -> ./plots/lsf_ccf_0.png
+
+dlcc.plot_rvs(save_path='./figures/custom_name.png')   # explicit path wins
+```
+
+Combined with `diagnostics_on=True`, which plots automatically at the end of a run,
+this gives you a saved figure set with no extra calls.
+
+Note the default file names are fixed, so a loop over configurations writing into one
+folder will overwrite. Use a different `save_path` per configuration, or pass explicit
+file names.
+
+## Settings
+
+All of these are fields of the `dlcSettings` dataclass and can be set from a dict or
+yaml. A bare number is given the default's unit automatically, so `vsini: 2` in yaml
+becomes `2 km/s`. `printSettings()` dumps the current values.
+
+| setting | default | meaning |
+|---|---|---|
+| `telescope` | `'Keck'` | `Keck`, `TMT`, `Palomar`/`Hale` |
+| `bandpass` | `'yJ'` | `yJ` or `HK`; selects the coupling map for Keck and TMT |
+| `coupling_map_boundary` | `50 mas` | half-width of the coupling map region to use |
+| `R` | `100000` | resolving power, sets the instrument LSF width |
+| `xoffsets`, `yoffsets` | `[0,0] mas` | star positions w.r.t. the fiber, paired element-wise |
+| `tt_dyn` | `[0,0] mas` | per-position tip/tilt jitter sigma, used by `run_ttjitter` |
+| `vsini` | `2 km/s` | projected stellar rotation |
+| `theta` | `0 deg` | on-sky angle of the stellar spin axis |
+| `diameter` | `13 mas` | stellar angular diameter |
+| `save_path` | `None` | folder to write plots into, created if missing |
+| `DAR` | `True` | **not implemented**, see below |
+
+Unrecognised config keys are silently ignored — `_loadConfig` only assigns keys that
+already exist on the dataclass, so a typo'd setting fails quietly rather than raising.
+
+## Outputs after a run
+
+| attribute | contents |
+|---|---|
+| `vels` | Quantity array, RV offset per position, relative to on-axis |
+| `coupling_efficiency` | dict keyed by position index, mean coupling over the stellar disc |
+| `ccfs_shifted`, `vprofs_shifted` | dicts of the CCF and line profile per position |
+| `coupling_maps_shifted` | dict of the shifted coupling map per position |
+| `x_jitter`, `y_jitter` | dicts of the jitter pattern per position (`run_ttjitter` only) |
+| `vprof_ref`, `ccf_ref`, `vel_ref` | the on-axis reference used as the zero point |
+
+## Plots
+
+| method | shows |
+|---|---|
+| `plot_rvs(xarr, xlabel)` | RV offset vs. index, or vs. any x array such as BJD |
+| `plot_star_fiber()` | coupling map with the star's velocity map, de-shifted and de-rotated into the natural sky view |
+| `plot_star_fiber_raw()` | the shifted maps as actually computed, star fixed at centre |
+| `plot_star_fiber_RValigned()` | same, rotated so the stellar velocity axis is horizontal |
+| `plot_lsf_ccf(index)` | line profile and CCF, on-axis vs. off-axis, with the fitted minima marked |
+
+All take `save_path` and all return `(fig, ax)` so you can adjust them afterwards.
+
+## Gotchas
+
+**`coupling_map_boundary` must exceed your largest offset.** The map is shifted with
+`np.roll`, which wraps, so an offset past the edge folds the opposite side of the map
+back in and silently returns nonsense. `_compute_shift` now raises a `ValueError`
+naming the offset and the boundary when this would happen. Note the check is on the
+shift *after* rotation by `theta`, so a large `theta` can push a nominally in-bounds
+x offset out of bounds in y.
+
+**Cost scales as the square of the boundary.** `gridsize = 2 * (boundary / plate_scale) * 10`,
+so a 60 mas boundary at Keck's 0.119 mas/pix gives a 10080 x 10080 grid — 406 MB per
+array, and several seconds per `plot_star_fiber` call. Use the smallest boundary that
+contains your offsets.
+
+**Palomar and Hale reuse the Keck yJ map** with its plate scale multiplied by 3.5 to
+approximate the smaller aperture. A proper Palomar coupling model doesn't exist yet.
+`bandpass` is ignored for these telescopes.
+
+**`DAR` does nothing.** The `DAR` setting and `AtmEffects.DAR()` are placeholders;
+the method body is `pass` and is never called. The bool also shadows the method name on
+the instance, so `self.DAR` is `True`, not callable — that will need renaming when
+differential atmospheric refraction is actually implemented. `generate_star_spot` and
+`load_phoenix` are likewise stubs.
+
+## Examples
+
+| file | what it does |
+|---|---|
+| `examples/run_DLC_sim.ipynb` | full workflow: load the MuGem observation log, convert guider positions to offsets, simulate, plot RV vs. BJD |
+| `examples/RVerr_scan_circles.ipynb` | RV bias vs. coupling efficiency for perfect scanning rings of increasing diameter |
+| `examples/RVerr_scan_radius.py` | script version of the same scan |
+
+## Download data
+
+The spectra and observation log are not in the repo. From the `_data` folder:
+
+```
+rsync -av abaker@hcig1.caltech.edu:/scr3/asjlin/parvi_data/spec_master2025_hybridwavesol_pad45/MuGem .
+```
+
+## Todo
+
+- make a plot for the jitter case that shows the combined jitter coupling map
+- build a Palomar-specific coupling map rather than rescaling Keck
+- implement DAR

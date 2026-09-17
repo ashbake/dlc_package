@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import os
 from pathlib import Path
 
+import warnings
+
 from scipy.ndimage import zoom, shift, rotate
 from scipy.optimize import curve_fit
 
@@ -152,7 +154,6 @@ class AtmEffects():
         """
         pass
 
-
 @dataclass
 class dlcSettings():
     """All settings for DLC class"""
@@ -182,6 +183,12 @@ class dlcSettings():
     # DAR on/off
     DAR: bool = True
 
+    # OUTPUT
+    # save_path [str | None] default: None - folder to write plots into. if set, every
+    #    plot_* call saves itself there under a default file name and the folder is
+    #    created if it doesn't exist. if None, plots are shown but never written
+    save_path: str = None
+
 class DifferentialLimbCoupling(dlcSettings,
                                StellarModel,
                                AtmEffects):
@@ -204,7 +211,11 @@ class DifferentialLimbCoupling(dlcSettings,
         if config != None: 
             self._loadConfig(config) 
         
-        self.diagnostics_on = diagnostics_on 
+        self.diagnostics_on = diagnostics_on
+
+        # make the plot folder now so it is there before anything tries to plot
+        if self.save_path is not None:
+            Path(self.save_path).mkdir(parents=True, exist_ok=True)
 
         # run through presets to load necessary files and settings for the class
         self._loadCouplingMap()
@@ -236,10 +247,10 @@ class DifferentialLimbCoupling(dlcSettings,
                 raise ValueError("Invalid bandpass for TMT coupling map. Options are 'yJ' or 'HK'.")
         elif self.telescope=='Palomar' or self.telescope=='Hale':
             coupling_file_name = 'staticModel_Keck_yJ_defoc0nmRMS_LO0nmRMS_Fnum3.67_atm0_adc0_nWvls10_PL0.fits'
-            raise(Warning, 'Loading Keck coupling map for Palomar/Hale in yJ band, - scaling plate scale to match Palomar since using Keck coupling map, should make a Palomar specific coupling map in the future')
+            warnings.warn('Loading Keck coupling map for Palomar/Hale in yJ band, - scaling plate scale to match Palomar since using Keck coupling map, should make a Palomar specific coupling map in the future')
             # use keck one for now, but should make a palomar specific one in the future, just use the keck one and scale it to match the plate scale of palomar since the coupling map is in pixel units
         else:
-            raise(Warning, 'Telescope Data not available, options are: Keck, TMT, Palomar, Hale')
+            raise ValueError('Telescope Data not available, options are: Keck, TMT, Palomar, Hale')
         
         coupling_map_path = FILEPATH / "data/coupling_maps/" / coupling_file_name
         print(f'Loading {coupling_map_path}')
@@ -338,19 +349,28 @@ class DifferentialLimbCoupling(dlcSettings,
         y = -yoffset
 
         shifted_offset   = np.sqrt(x**2 + y**2)  # mas, from center of field
-        if x==0: 
-            phi=90 * u.deg
-        else:
-            phi = np.arctan(y/x) # bc x and y have units, returns radians already
 
-        if x < 0:
-            phi += 180 * u.deg # arctan only gives angles between -90 and 90, need to add 180 if in left half of field
-        
+        # arctan2 resolves all four quadrants, including x=0 with y<0 which
+        # arctan cannot distinguish from y>0
+        phi = np.arctan2(y, x) # bc x and y have units, returns radians already
+
         angle            = phi + theta           # degrees, shifts coupling map
 
         shifted_offset_pix = shifted_offset  * 1./ self.plate_scale_coupling   # pixels
         xshift_pix = shifted_offset_pix.decompose().value * np.cos(angle)
         yshift_pix = shifted_offset_pix.decompose().value * np.sin(angle)
+
+        # _transform_coupling_map shifts with np.roll, which wraps. a shift past
+        # the half width of the cropped map folds the far side of the map back in
+        # and silently returns garbage instead of the ~0 coupling expected out there
+        half_width = self.gridsize / 2.
+        if abs(xshift_pix) > half_width or abs(yshift_pix) > half_width:
+            raise ValueError(
+                f"Offset ({xoffset}, {yoffset}) at theta={theta} shifts the coupling map by "
+                f"({float(xshift_pix):.0f}, {float(yshift_pix):.0f}) pix, beyond its half width of "
+                f"{half_width:.0f} pix (coupling_map_boundary={self.coupling_map_boundary}). "
+                "Increase coupling_map_boundary or reduce the offset."
+            )
 
         return xshift_pix, yshift_pix
     
@@ -573,9 +593,8 @@ class DifferentialLimbCoupling(dlcSettings,
             shifted_coupling_map = np.zeros_like(self.coupling_map)
             
             for x_jitter_i, y_jitter_i in zip(x_jitter, y_jitter):
-                if x_jitter_i > self.coupling_map_boundary or y_jitter_i > self.coupling_map_boundary:
-                    raise ValueError(f"Jitter offset {x_jitter_i}, {y_jitter_i} exceeds coupling map boundary of {self.coupling_map_boundary}. Adjust jitter parameters or increase coupling map size.")
-                # compute shifted coupling map
+                # _compute_shift raises if the offset plus this jitter excursion
+                # lands outside the coupling map, so no separate check here
                 shifted_offset, angle = self._compute_shift(self.xoffsets[i] + x_jitter_i,yoffset + y_jitter_i,self.theta)
                 shifted_coupling_map += self._transform_coupling_map(self.coupling_map, shifted_offset, angle)
             
@@ -609,11 +628,43 @@ class DifferentialLimbCoupling(dlcSettings,
             self.plot_lsf_ccf()
 
 
+    def _resolve_save_path(self, save_path, default_name):
+        """
+        work out where a figure should be written
+
+        inputs
+        ------
+        save_path - path handed to the plot call, wins if given
+        default_name - file name to use inside self.save_path when the plot call
+            didn't name one
+
+        returns
+        -------
+        path to write to, or None if neither the call nor the config asked for a
+        file, in which case the figure is shown but not saved
+        """
+        if save_path is None:
+            if self.save_path is None:
+                return None
+            save_path = Path(self.save_path) / default_name
+
+        # covers a nested path handed straight to the plot call as well as the
+        # config folder, which __init__ has already made
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        return str(save_path)
+
     def plot_star_fiber_raw(self, save_path=None):
         """
-        plot the fiber coupling map and overplot the stellar positions with 
+        plot the fiber coupling map and overplot the stellar positions with
         the reference star shown with its velocity map. This is the raw shifted
         coupling maps with the star always in the center.
+
+        input
+        -----
+        save_path - explicit file to write to. if None, falls back to
+            <self.save_path>/star_fiber_raw.png when save_path is set in the config
         """
         fig, axs = plt.subplots(1,3,figsize=[10,4])
         extent = self.plate_scale_coupling * len(self.stellar_im_vel)
@@ -639,9 +690,12 @@ class DifferentialLimbCoupling(dlcSettings,
         
         plt.suptitle(f'Star Coupling Maps, As Calculated\ntheta={self.theta}')
 
+        save_path = self._resolve_save_path(save_path, 'star_fiber_raw.png')
         if save_path is not None:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
+
+        return fig, axs
 
     def plot_star_fiber_RValigned(self, save_path=None):
         """
@@ -695,9 +749,13 @@ class DifferentialLimbCoupling(dlcSettings,
 
         # make super title
         plt.suptitle(f'Star Coupling Maps, RV aligned\ntheta={self.theta}')
+
+        save_path = self._resolve_save_path(save_path, 'star_fiber_RValigned.png')
         if save_path is not None:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
+
+        return fig, axs
 
     def plot_star_fiber(self, save_path=None):
         """
@@ -707,14 +765,15 @@ class DifferentialLimbCoupling(dlcSettings,
 
         input
         -----
-        save_path - if not None, will save the figure to the provided path
+        save_path - explicit file to write to. if None, falls back to
+            <self.save_path>/star_fiber.png when save_path is set in the config
         """
         fig, axs = plt.subplots(1,3,figsize=[10,4])
         extent = self.plate_scale_coupling * self.coupling_map.shape[0]
         extent = extent.value
 
         # PLOT PANEL 0 - reference position
-        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', extent=(-extent/2, extent/2, -extent/2, extent/2))
+        axs[0].imshow((self.stellar_im_vel*self.coupling_map  + self.coupling_map),cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[0].plot(self.xoffsets, self.yoffsets, marker='x', color='k', label='Offset positions')
 
         axs[0].set_xlabel('X [mas]')
@@ -726,20 +785,29 @@ class DifferentialLimbCoupling(dlcSettings,
             shifted_offset, angle = self._compute_shift(xoffset,yoffset,theta)
             unshifted_map = self._transform_coupling_map(coupling_map_shifted, -shifted_offset, -angle)
             return unshifted_map
-        
+
+        def derotate(image):
+            """ rotate by theta and crop back down to the coupling map size """
+            # rotate spline filters the whole array, which costs seconds at these
+            # grid sizes, so skip it when there is no rotation to apply
+            if self.theta == 0 * u.deg:
+                return image
+            # reshape=False keeps the output at the input size, which is what the
+            # crop below reduces it to anyway
+            rotated = rotate(image, self.theta, reshape=False)
+            midpix = int(rotated.shape[0] / 2.)
+            wz = int(self.coupling_map.shape[0] / 2.)
+            return rotated[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
+
         # plot de shifted coupling map
         unshifted_temp_map = np.zeros_like(self.coupling_map)
         for i in range(len(self.xoffsets)):
             temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] # + self.coupling_maps_shifted[i]
             unshifted_temp_map += deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
-        
+
         # add rotate here
-        unshifted_derotated_temp_map = rotate(unshifted_temp_map, self.theta)
-        # rotating will create bigger array, so need to crop back down to original size
-        midpix = int(unshifted_derotated_temp_map.shape[0] / 2.)
-        wz = int(self.coupling_map.shape[0] / 2.)
-        unshifted_derotated_map = unshifted_derotated_temp_map[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
-        
+        unshifted_derotated_map = derotate(unshifted_temp_map)
+
         # PLOT PANEL 2 - shifted, derotated positions
         axs[1].imshow(unshifted_derotated_map + self.coupling_map,cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[1].set_xlabel('X [mas]')
@@ -748,12 +816,9 @@ class DifferentialLimbCoupling(dlcSettings,
         # TODO make coupling map contours
 
         # third panel - plot just one
-        temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] + self.coupling_maps_shifted[i]
+        temp_shifted_map = self.stellar_im_vel*self.coupling_maps_shifted[i] #+ self.coupling_maps_shifted[i]
         unshifted_temp_map = deshift_coupling_map(temp_shifted_map, self.xoffsets[i], self.yoffsets[i], self.theta)
-        test = rotate(unshifted_temp_map, self.theta)
-        midpix = int(test.shape[0] / 2.)
-        wz = int(self.coupling_map.shape[0] / 2.)
-        unshifted_derotated_map = test[midpix-wz:midpix+wz, midpix-wz:midpix+wz]
+        unshifted_derotated_map = derotate(unshifted_temp_map)
 
         axs[2].imshow(unshifted_derotated_map,cmap='RdBu_r', origin='lower', extent=(-extent/2, extent/2, -extent/2, extent/2))
         axs[2].set_xlabel('X [mas]')
@@ -761,11 +826,14 @@ class DifferentialLimbCoupling(dlcSettings,
         axs[2].plot(self.xoffsets, self.yoffsets, marker='x', color='k', alpha=0.1, label='Offset positions')
 
         plt.suptitle(f'Star Coupling Maps, Natural View\ntheta={self.theta}')
-        
+
+        save_path = self._resolve_save_path(save_path, 'star_fiber.png')
         if save_path is not None:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            
+
         plt.show()
+
+        return fig, axs
 
     def plot_rvs(self, xarr=None, xlabel=None, save_path=None):
         """
@@ -774,7 +842,8 @@ class DifferentialLimbCoupling(dlcSettings,
         inputs
         ------
         xarr - array of x values to plot against, if None will just use the index of the velocities
-        save_path - if not None, will save the figure to the provided path
+        save_path - explicit file to write to. if None, falls back to
+            <self.save_path>/rvs.png when save_path is set in the config
         """
         if xarr is None:
             xarr = np.arange(len(self.vels))
@@ -789,10 +858,13 @@ class DifferentialLimbCoupling(dlcSettings,
         ax.set_title(f'{self.telescope} DLC Simulation, theta={self.theta}')
         ax.grid(alpha=0.5)
 
+        save_path = self._resolve_save_path(save_path, 'rvs.png')
         if save_path is not None:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            
+
         plt.show()
+
+        return fig, ax
 
     def plot_lsf_ccf(self,index=0, save_path = None):
         """
@@ -801,7 +873,8 @@ class DifferentialLimbCoupling(dlcSettings,
         inputs
         ------
         index - which shifted position to plot (default: 0)
-        save_path - if not None, will save the figure to the provided path
+        save_path - explicit file to write to. if None, falls back to
+            <self.save_path>/lsf_ccf_<index>.png when save_path is set in the config
         """
         # PLot the stellar profile and that convolved with the instrument profile
         import matplotlib.patheffects as pe
@@ -835,10 +908,13 @@ class DifferentialLimbCoupling(dlcSettings,
         axs[1].set_ylabel('Relative Intensity')
         axs[1].legend(loc='best',handlelength=2,handletextpad=0.5)#,ncols=2)
 
+        save_path = self._resolve_save_path(save_path, f'lsf_ccf_{index}.png')
         if save_path is not None:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
         plt.show()
+
+        return fig, axs
 
     def printSettings(self):
         """
