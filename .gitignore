@@ -1,0 +1,9 @@
+# coupling map models - too big for git, see readme for where to get them
+*.fits
+
+# python
+__pycache__/
+*.py[cod]
+
+# macos
+.DS_Store
